@@ -1,4 +1,5 @@
 import aiohttp
+import asyncio
 import json
 import random
 from config import OPENROUTER_API_KEY, OPENROUTER_URL
@@ -64,10 +65,11 @@ class OpenRouterClient:
         Выбирает случайную бесплатную модель из доступных
         """
         models = [
-            "mistralai/mistral-7b-instruct:free",
-            "huggingfaceh4/zephyr-7b-beta:free",
-            "google/gemma-7b-it:free",
-            "meta-llama/llama-3-8b-instruct:free"
+            #"deepseek/deepseek-llm-7b-chat:free",
+            "deepseek/deepseek-chat-v3.1:free",
+            # "huggingfaceh4/zephyr-7b-beta:free",
+            # "google/gemma-7b-it:free",
+            # "meta-llama/llama-3-8b-instruct:free"
         ]
         return random.choice(models)
         

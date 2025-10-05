@@ -1,16 +1,10 @@
+import asyncio
+import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-import asyncio
-import random
-import logging
-
-from config import BOT_TOKEN
-from llm_client import llm_client
-from user_profiles import get_user_profile, update_user_profile, increment_message_count
+from aiogram.types import Message, ContentType
+import sqlite3
+from config import BOT_TOKEN, ADMIN_ID
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -18,323 +12,301 @@ logger = logging.getLogger(__name__)
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher()
 
-# Состояния для машины состояний (FSM)
-class ProfileStates(StatesGroup):
-    waiting_for_gender = State()
-    waiting_for_age = State()
-    waiting_for_companion_gender = State()
-    waiting_for_companion_age = State()
-    waiting_for_name = State()
+# Инициализация БД
+def init_db():
+    conn = sqlite3.connect('messages.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS message_links
+                 (admin_message_id INTEGER PRIMARY KEY,
+                  user_id INTEGER,
+                  user_message_id INTEGER,
+                  chat_id INTEGER,
+                  username TEXT)''')
+    conn.commit()
+    conn.close()
 
-# Запасные ответы (если API не работает)
-FALLBACK_ANSWERS = [
-    "Чё каво? Я сейчас туплю...",
-    "Ась? Не понял, повтори",
-    "Занят, мемы смотрю, потом отвечу",
-    "Ты про что? Объясни нормально",
-    "Мог бы быть как Илон Маск, но лень",
-    "Гонишь))",
-    "Сам такой!",
-    "Напиши потом, а? А то я занят",
-    "Чёт скучно... Расскажи что-нибудь смешное",
-    "Я бот, а ты кто? Напомни",
-    "Серьёзно? О_о",
-    "Ну ты ваще...",
-    "Ахах, хорош!",
-    "И чо дальше?",
-    "Мне похуй если честно",
-    "Норм тема, продолжай",
-    "Бро, я в ахуе...",
-    "Это ты так ко мне подкатываешь?",
-    "Погоди, я чипсы доем",
-    "Опять ты со своим диалогом..."
-]
+def save_message_link(admin_message_id, user_id, user_message_id, chat_id, username):
+    conn = sqlite3.connect('messages.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO message_links VALUES (?, ?, ?, ?, ?)",
+              (admin_message_id, user_id, user_message_id, chat_id, username))
+    conn.commit()
+    conn.close()
 
-# Функции для создания клавиатур
-def get_gender_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👦 Мальчик"), KeyboardButton(text="👧 Девочка")],
-            [KeyboardButton(text="🤷 Другое")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+def get_user_by_admin_message(admin_message_id):
+    conn = sqlite3.connect('messages.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM message_links WHERE admin_message_id=?", (admin_message_id,))
+    result = c.fetchone()
+    conn.close()
+    return result
 
-def get_companion_gender_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👦 Хочу общаться с мальчиком"), KeyboardButton(text="👧 Хочу общаться с девочкой")],
-            [KeyboardButton(text="🤷 Не важно")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+# Форматирование информации о пользователе
+def format_user_info(user, chat_id):
+    return (f"👤 *От:* {user.first_name or ''} {user.last_name or ''}\n"
+            f"📛 @{user.username or 'нет'}\n"
+            f"🆔 ID: `{user.id}`\n"
+            f"💬 Chat ID: `{chat_id}`")
 
-def get_age_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="13-17"), KeyboardButton(text="18-25")],
-            [KeyboardButton(text="26-35"), KeyboardButton(text="36+")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-def get_companion_age_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Ровесник(ца)"), KeyboardButton(text="Чуть старше")],
-            [KeyboardButton(text="Чуть младше"), KeyboardButton(text="Не важно")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="💬 Поболтать"), KeyboardButton(text="⚙️ Настройки")],
-            [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="ℹ️ Помощь")]
-        ],
-        resize_keyboard=True
-    )
-
-# Команды бота
+# Обработчик команды /start
 @dp.message(Command("start"))
-async def start_cmd(message: Message, state: FSMContext):
-    await state.clear()
-    user_name = message.from_user.first_name or "друг"
-    
+async def cmd_start(message: Message):
     await message.answer(
-        f"👋 Привет, {user_name}!\n\n"
-        f"Я бот с характером для живого общения 🎭\n"
-        f"Давай настроим твой профиль, чтобы мне было проще с тобой общаться:",
-        reply_markup=get_gender_keyboard()
-    )
-    await state.set_state(ProfileStates.waiting_for_gender)
-
-@dp.message(Command("help"))
-async def help_cmd(message: Message):
-    help_text = """
-🤖 <b>Помощь по боту</b>
-
-<b>Основные команды:</b>
-/start - начать настройку профиля
-/settings - изменить настройки профиля  
-/profile - посмотреть свой профиль
-/help - показать эту справку
-
-<b>Как работает бот:</b>
-• Я использую ИИ для генерации ответов
-• Подстраиваюсь под твой стиль общения
-• Могу быть немного грубым (по-дружески)
-• Стараюсь поддерживать любые темы
-
-<b>Кнопки:</b>
-💬 Поболтать - начать общение
-⚙️ Настройки - изменить профиль
-👤 Мой профиль - посмотреть настройки
-
-Если бот не отвечает - возможно, закончились бесплатные запросы к API.
-    """
-    await message.answer(help_text, reply_markup=get_main_keyboard())
-
-@dp.message(Command("settings"))
-async def settings_cmd(message: Message, state: FSMContext):
-    await message.answer(
-        "⚙️ <b>Настройки профиля</b>\n\n"
-        "Давай обновим твои данные. Для начала выбери свой пол:",
-        reply_markup=get_gender_keyboard(),
-        parse_mode="HTML"
-    )
-    await state.set_state(ProfileStates.waiting_for_gender)
-
-@dp.message(Command("profile"))
-async def profile_cmd(message: Message):
-    profile = get_user_profile(message.from_user.id)
-    
-    # Красивое описание настроек
-    gender_emoji = "👦" if profile['user_gender'] == "мальчик" else "👧" if profile['user_gender'] == "девочка" else "🤷"
-    companion_emoji = "👦" if profile['companion_gender'] == "мальчик" else "👧" if profile['companion_gender'] == "девочка" else "🤷"
-    
-    profile_text = f"""
-👤 <b>Твой профиль</b>
-
-{gender_emoji} <b>Ты:</b> {profile['user_gender']}, {profile['user_age']}
-📛 <b>Имя:</b> {profile['user_name']}
-{companion_emoji} <b>Собеседник:</b> {profile['companion_gender']}, {profile['companion_age']}
-💬 <b>Сообщений:</b> {profile.get('messages_count', 0)}
-
-Изменить настройки: /settings
-    """
-    await message.answer(profile_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
-
-# Обработчики кнопок
-@dp.message(F.text == "ℹ️ Помощь")
-async def help_button(message: Message):
-    await help_cmd(message)
-
-@dp.message(F.text == "⚙️ Настройки")
-async def settings_button(message: Message, state: FSMContext):
-    await settings_cmd(message, state)
-
-@dp.message(F.text == "👤 Мой профиль")
-async def profile_button(message: Message):
-    await profile_cmd(message)
-
-@dp.message(F.text == "💬 Поболтать")
-async def chat_button(message: Message):
-    profile = get_user_profile(message.from_user.id)
-    if profile['user_gender'] == 'не указано':
-        await message.answer("Сначала настрой профиль! Напиши /start")
-        return
-        
-    await message.answer(
-        f"Отлично, {profile['user_name']}! 💬\n"
-        f"Просто напиши что-нибудь - отвечу как {profile['companion_gender']} {profile['companion_age']} лет!",
-        reply_markup=ReplyKeyboardRemove()
+        "🤖 Привет! Я супер-умный ИИ бот для общения. "
+        "Можешь поговорить со мной на любую тему!\n\n"
+        "Просто напиши что-нибудь, и я отвечу!",
+        parse_mode="Markdown"
     )
 
-# Обработчики состояний настройки профиля
-@dp.message(ProfileStates.waiting_for_gender)
-async def process_gender(message: Message, state: FSMContext):
-    gender_map = {
-        "👦 Мальчик": "мальчик",
-        "👧 Девочка": "девочка", 
-        "🤷 Другое": "не указано"
-    }
+# Обработчик ТЕКСТОВЫХ сообщений от пользователей
+@dp.message(F.content_type == ContentType.TEXT, F.from_user.id != ADMIN_ID)
+async def handle_user_text(message: Message):
+    user = message.from_user
     
-    gender = gender_map.get(message.text, "не указано")
-    update_user_profile(message.from_user.id, user_gender=gender)
+    # Формируем сообщение для админа
+    admin_text = f"{format_user_info(user, message.chat.id)}\n\n"
+    admin_text += f"💬 *Сообщение:* {message.text}"
     
-    await message.answer("Сколько тебе лет?", reply_markup=get_age_keyboard())
-    await state.set_state(ProfileStates.waiting_for_age)
-
-@dp.message(ProfileStates.waiting_for_age)
-async def process_age(message: Message, state: FSMContext):
-    if message.text not in ["13-17", "18-25", "26-35", "36+"]:
-        await message.answer("Пожалуйста, выбери возраст из кнопок ниже:", reply_markup=get_age_keyboard())
-        return
-        
-    update_user_profile(message.from_user.id, user_age=message.text)
-    
-    await message.answer("С кем хочешь пообщаться?", reply_markup=get_companion_gender_keyboard())
-    await state.set_state(ProfileStates.waiting_for_companion_gender)
-
-@dp.message(ProfileStates.waiting_for_companion_gender)
-async def process_companion_gender(message: Message, state: FSMContext):
-    gender_map = {
-        "👦 Хочу общаться с мальчиком": "мальчик",
-        "👧 Хочу общаться с девочкой": "девочка",
-        "🤷 Не важно": "не важно"
-    }
-    
-    companion_gender = gender_map.get(message.text, "не важно")
-    update_user_profile(message.from_user.id, companion_gender=companion_gender)
-    
-    await message.answer("Какого возраста собеседник?", reply_markup=get_companion_age_keyboard())
-    await state.set_state(ProfileStates.waiting_for_companion_age)
-
-@dp.message(ProfileStates.waiting_for_companion_age)
-async def process_companion_age(message: Message, state: FSMContext):
-    age_map = {
-        "Ровесник(ца)": "ровесник",
-        "Чуть старше": "чуть старше",
-        "Чуть младше": "чуть младше", 
-        "Не важно": "не важно"
-    }
-    
-    companion_age = age_map.get(message.text, "не важно")
-    update_user_profile(message.from_user.id, companion_age=companion_age)
-    
-    await message.answer(
-        "Как тебя зовут? (или как хочешь, чтобы к тебе обращались)\n\n"
-        "<i>Можно написать любое имя или прозвище</i>",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
+    # Отправляем админу
+    admin_message = await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=admin_text,
+        parse_mode="Markdown"
     )
-    await state.set_state(ProfileStates.waiting_for_name)
-
-@dp.message(ProfileStates.waiting_for_name)
-async def process_name(message: Message, state: FSMContext):
-    user_name = message.text.strip() if message.text.strip() else "друг"
-    update_user_profile(message.from_user.id, user_name=user_name)
     
-    profile = get_user_profile(message.from_user.id)
-    
-    await message.answer(
-        f"🎉 <b>Отлично, {user_name}!</b>\n\n"
-        f"Профиль настроен!\n"
-        f"Теперь я буду общаться с тобой как <b>{profile['companion_gender']} {profile['companion_age']}</b> лет.\n\n"
-        f"Просто напиши что-нибудь для начала разговора! ✨",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
+    # Сохраняем связь
+    save_message_link(
+        admin_message_id=admin_message.message_id,
+        user_id=user.id,
+        user_message_id=message.message_id,
+        chat_id=message.chat.id,
+        username=user.username or user.first_name
     )
-    await state.clear()
+    
+    logger.info(f"Переслано текстовое сообщение от {user.username}")
 
-# Основной обработчик сообщений
-@dp.message()
-async def ai_reply(message: Message):
-    # Игнорируем команды и слишком длинные сообщения
-    if message.text.startswith('/') or len(message.text) > 500:
-        return
-        
-    # Проверяем, есть ли настройки профиля
-    profile = get_user_profile(message.from_user.id)
-    if profile['user_gender'] == 'не указано':
-        await message.answer(
-            "🤔 Сначала давай настроим твой профиль!\n"
-            "Напиши /start чтобы начать настройку",
-            reply_markup=get_main_keyboard()
-        )
-        return
+# Обработчик ФОТО от пользователей
+@dp.message(F.content_type == ContentType.PHOTO, F.from_user.id != ADMIN_ID)
+async def handle_user_photo(message: Message):
+    user = message.from_user
     
-    # Увеличиваем счетчик сообщений
-    increment_message_count(message.from_user.id)
+    admin_text = f"{format_user_info(user, message.chat.id)}\n\n"
+    admin_text += f"📷 *Фото*"
+    if message.caption:
+        admin_text += f"\n📝 *Подпись:* {message.caption}"
     
-    # Случайная задержка для естественности (1-5 секунд)
-    delay = random.uniform(1, 5)
-    await asyncio.sleep(delay)
+    admin_message = await bot.send_photo(
+        chat_id=ADMIN_ID,
+        photo=message.photo[-1].file_id,
+        caption=admin_text,
+        parse_mode="Markdown"
+    )
     
-    # Показываем действие "печатает"
-    await bot.send_chat_action(message.chat.id, "typing")
+    save_message_link(
+        admin_message_id=admin_message.message_id,
+        user_id=user.id,
+        user_message_id=message.message_id,
+        chat_id=message.chat.id,
+        username=user.username or user.first_name
+    )
     
-    # Получаем ответ от LLM
-    ai_response = await llm_client.get_response(message.from_user.id, message.text)
-    
-    # Если API вернуло ошибку, используем запасные ответы
-    if any(ai_response.startswith(prefix) for prefix in ['❌', '⚠️', '⚠', 'Ошибка']):
-        logger.warning(f"API Error for user {message.from_user.id}: {ai_response}")
-        ai_response = random.choice(FALLBACK_ANSWERS)
-    
-    # Добавляем небольшую случайную задержку перед отправкой
-    await asyncio.sleep(random.uniform(0.5, 2))
-    await message.answer(ai_response, reply_markup=get_main_keyboard())
+    logger.info(f"Переслано фото от {user.username}")
 
-# Обработчик ошибок
-@dp.errors()
-async def errors_handler(update, exception):
-    logger.error(f"Ошибка: {exception}", exc_info=True)
+# Обработчик ГОЛОСОВЫХ сообщений
+@dp.message(F.content_type == ContentType.VOICE, F.from_user.id != ADMIN_ID)
+async def handle_user_voice(message: Message):
+    user = message.from_user
     
-# Запуск бота
-async def main():
-    logger.info("Запускаю бота...")
+    admin_text = f"{format_user_info(user, message.chat.id)}\n\n"
+    admin_text += f"🎤 *Голосовое сообщение*"
     
-    # Проверяем наличие токена
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не найден! Проверь .env файл")
+    admin_message = await bot.send_voice(
+        chat_id=ADMIN_ID,
+        voice=message.voice.file_id,
+        caption=admin_text,
+        parse_mode="Markdown"
+    )
+    
+    save_message_link(
+        admin_message_id=admin_message.message_id,
+        user_id=user.id,
+        user_message_id=message.message_id,
+        chat_id=message.chat.id,
+        username=user.username or user.first_name
+    )
+    
+    logger.info(f"Переслано голосовое от {user.username}")
+
+# Обработчик ВИДЕО сообщений
+@dp.message(F.content_type == ContentType.VIDEO_NOTE, F.from_user.id != ADMIN_ID)
+async def handle_user_video_note(message: Message):
+    user = message.from_user
+    
+    admin_text = f"{format_user_info(user, message.chat.id)}\n\n"
+    admin_text += f"📹 *Видео-сообщение*"
+    
+    admin_message = await bot.send_video_note(
+        chat_id=ADMIN_ID,
+        video_note=message.video_note.file_id,
+        caption=admin_text
+    )
+    
+    save_message_link(
+        admin_message_id=admin_message.message_id,
+        user_id=user.id,
+        user_message_id=message.message_id,
+        chat_id=message.chat.id,
+        username=user.username or user.first_name
+    )
+    
+    logger.info(f"Переслано видео-сообщение от {user.username}")
+
+# Обработчик СТИКЕРОВ
+@dp.message(F.content_type == ContentType.STICKER, F.from_user.id != ADMIN_ID)
+async def handle_user_sticker(message: Message):
+    user = message.from_user
+    
+    admin_text = f"{format_user_info(user, message.chat.id)}\n\n"
+    admin_text += f"🩷 *Стикер*"
+    
+    # Сначала отправляем информацию
+    info_message = await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=admin_text,
+        parse_mode="Markdown"
+    )
+    
+    # Затем стикер
+    admin_message = await bot.send_sticker(
+        chat_id=ADMIN_ID,
+        sticker=message.sticker.file_id
+    )
+    
+    save_message_link(
+        admin_message_id=admin_message.message_id,
+        user_id=user.id,
+        user_message_id=message.message_id,
+        chat_id=message.chat.id,
+        username=user.username or user.first_name
+    )
+    
+    logger.info(f"Переслан стикер от {user.username}")
+
+# Обработчик ДОКУМЕНТОВ
+@dp.message(F.content_type == ContentType.DOCUMENT, F.from_user.id != ADMIN_ID)
+async def handle_user_document(message: Message):
+    user = message.from_user
+    
+    admin_text = f"{format_user_info(user, message.chat.id)}\n\n"
+    admin_text += f"📎 *Документ:* {message.document.file_name}"
+    if message.caption:
+        admin_text += f"\n📝 *Подпись:* {message.caption}"
+    
+    admin_message = await bot.send_document(
+        chat_id=ADMIN_ID,
+        document=message.document.file_id,
+        caption=admin_text,
+        parse_mode="Markdown"
+    )
+    
+    save_message_link(
+        admin_message_id=admin_message.message_id,
+        user_id=user.id,
+        user_message_id=message.message_id,
+        chat_id=message.chat.id,
+        username=user.username or user.first_name
+    )
+    
+    logger.info(f"Переслан документ от {user.username}")
+
+# Обработчик ВИДЕО
+@dp.message(F.content_type == ContentType.VIDEO, F.from_user.id != ADMIN_ID)
+async def handle_user_video(message: Message):
+    user = message.from_user
+    
+    admin_text = f"{format_user_info(user, message.chat.id)}\n\n"
+    admin_text += f"🎥 *Видео*"
+    if message.caption:
+        admin_text += f"\n📝 *Подпись:* {message.caption}"
+    
+    admin_message = await bot.send_video(
+        chat_id=ADMIN_ID,
+        video=message.video.file_id,
+        caption=admin_text,
+        parse_mode="Markdown"
+    )
+    
+    save_message_link(
+        admin_message_id=admin_message.message_id,
+        user_id=user.id,
+        user_message_id=message.message_id,
+        chat_id=message.chat.id,
+        username=user.username or user.first_name
+    )
+    
+    logger.info(f"Переслано видео от {user.username}")
+
+# Обработчик ОТВЕТОВ АДМИНА (реплаев)
+@dp.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
+async def handle_admin_reply(message: Message):
+    reply_to_id = message.reply_to_message.message_id
+    
+    # Ищем оригинальное сообщение
+    original = get_user_by_admin_message(reply_to_id)
+    if not original:
+        await message.reply("❌ Не могу найти исходного отправителя для этого сообщения")
         return
+    
+    user_chat_id = original[3]  # chat_id пользователя
+    username = original[4]      # username
     
     try:
-        await dp.start_polling(bot)
+        # Отправляем ответ пользователю в зависимости от типа контента
+        if message.text:
+            await bot.send_message(chat_id=user_chat_id, text=message.text)
+        elif message.photo:
+            await bot.send_photo(
+                chat_id=user_chat_id,
+                photo=message.photo[-1].file_id,
+                caption=message.caption
+            )
+        elif message.voice:
+            await bot.send_voice(chat_id=user_chat_id, voice=message.voice.file_id)
+        elif message.video_note:
+            await bot.send_video_note(chat_id=user_chat_id, video_note=message.video_note.file_id)
+        elif message.sticker:
+            await bot.send_sticker(chat_id=user_chat_id, sticker=message.sticker.file_id)
+        elif message.document:
+            await bot.send_document(
+                chat_id=user_chat_id,
+                document=message.document.file_id,
+                caption=message.caption
+            )
+        elif message.video:
+            await bot.send_video(
+                chat_id=user_chat_id,
+                video=message.video.file_id,
+                caption=message.caption
+            )
+        else:
+            await message.reply("❌ Этот тип сообщения пока не поддерживается для ответа")
+            return
+        
+        # Подтверждение админу
+        await message.reply(f"✅ Ответ отправлен пользователю @{username}")
+        logger.info(f"Ответ отправлен пользователю {username}")
+        
     except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}")
-    finally:
-        await bot.session.close()
+        await message.reply(f"❌ Ошибка при отправке: {e}")
+        logger.error(f"Ошибка отправки: {e}")
+
+# Запуск бота
+async def main():
+    init_db()
+    logger.info("Бот запущен!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())

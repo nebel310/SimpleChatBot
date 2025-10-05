@@ -3,6 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
+from keep_alive import keep_alive
 
 from config import BOT_TOKEN, ADMIN_ID
 from database import init_db
@@ -19,6 +20,8 @@ from handlers.verification import (
     VerificationStates
 )
 from handlers.start import Registration
+
+keep_alive()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
